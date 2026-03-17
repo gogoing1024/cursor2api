@@ -1006,15 +1006,78 @@ async function preprocessImages(messages: AnthropicMessage[]): Promise<void> {
 
     // ★ Phase 1.5: 文本中嵌入的图片 URL/路径提取
     // OpenClaw/Telegram 等客户端可能将图片路径/URL 嵌入到文本消息中
-    // 例如: "The user sent an image" + 路径引用，或 {{MediaUrl}} 模板变量
-    // 常见格式：
-    //   - 本地文件路径: /Users/.../file.jpg
+    // 两种场景：
+    //   A) content 是纯字符串（如 "描述这张图片 /path/to/image.jpg"）
+    //   B) content 是数组，但 text block 中嵌入了路径
+    // 支持格式：
+    //   - 本地文件路径: /Users/.../file_362---eb90f5a2.jpg（含连字符、UUID）
     //   - file:// URL: file:///Users/.../file.jpg
     //   - HTTP(S) URL 以图片后缀结尾
-    const IMAGE_URL_IN_TEXT_RE = /(?:file:\/\/\/?|(?:https?:\/\/)[^\s]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg)(?:\?[^\s]*)?|(?:^|\s)(\/[\w.\/-]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg)))/gi;
+    //
+    // 使用 [^\s"')\]] 匹配路径中任意非空白/非引号字符（包括 -、UUID、中文等）
+    const IMAGE_EXT_RE = /\.(jpg|jpeg|png|gif|webp|bmp|svg)(?:[?#]|$)/i;
+
+    /** 从文本中提取所有图片 URL/路径 */
+    function extractImageUrlsFromText(text: string): string[] {
+        const urls: string[] = [];
+        // file:// URLs → /path
+        const fileRe = /file:\/\/\/([^\s"')\]]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg))/gi;
+        for (const m of text.matchAll(fileRe)) {
+            urls.push('/' + m[1]);
+        }
+        // HTTP(S) URLs
+        const httpRe = /(https?:\/\/[^\s"')\]]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg)(?:\?[^\s"')\]]*)?)/gi;
+        for (const m of text.matchAll(httpRe)) {
+            if (!urls.includes(m[1])) urls.push(m[1]);
+        }
+        // 本地绝对路径 (/开头，支持 UUID、连字符等)
+        const localRe = /(?:^|[\s"'(\[,:])(\/[^\s"')\]]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg))/gi;
+        for (const m of text.matchAll(localRe)) {
+            const path = m[1].trim();
+            if (!urls.includes(path)) urls.push(path);
+        }
+        return [...new Set(urls)];
+    }
+
+    /** 清理文本中的图片路径引用 */
+    function cleanImagePathsFromText(text: string, urls: string[]): string {
+        let cleaned = text;
+        for (const url of urls) {
+            cleaned = cleaned.split(url).join('[image]');
+        }
+        cleaned = cleaned.replace(/file:\/\/\/?(\[image\])/g, '$1');
+        return cleaned;
+    }
 
     for (const msg of messages) {
-        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+        if (msg.role !== 'user') continue;
+
+        // ★ 场景 A: content 是纯字符串（OpenClaw 等客户端常见）
+        if (typeof msg.content === 'string') {
+            const urls = extractImageUrlsFromText(msg.content);
+            if (urls.length > 0) {
+                console.log(`[Converter] 🔍 从纯字符串 content 中提取了 ${urls.length} 个图片路径:`, urls.map(u => u.substring(0, 80)));
+                const newBlocks: AnthropicContentBlock[] = [];
+                const cleanedText = cleanImagePathsFromText(msg.content, urls);
+                if (cleanedText.trim()) {
+                    newBlocks.push({ type: 'text', text: cleanedText });
+                }
+                for (const url of urls) {
+                    newBlocks.push({
+                        type: 'image',
+                        source: { type: 'url', media_type: guessMediaType(url), data: url },
+                    } as any);
+                }
+                (msg as any).content = newBlocks;
+            }
+            continue;
+        }
+
+        // ★ 场景 B: content 是数组
+        if (!Array.isArray(msg.content)) continue;
+        const hasExistingImages = msg.content.some(b => b.type === 'image');
+        if (hasExistingImages) continue;
+
         const newBlocks: AnthropicContentBlock[] = [];
         let extractedUrls = 0;
 
@@ -1023,55 +1086,26 @@ async function preprocessImages(messages: AnthropicMessage[]): Promise<void> {
                 newBlocks.push(block);
                 continue;
             }
-
-            // 检查文本中是否有图片 URL/路径（仅当该消息没有已有的 image block 时）
-            const hasExistingImages = msg.content.some(b => b.type === 'image');
-            if (hasExistingImages) {
+            const urls = extractImageUrlsFromText(block.text);
+            if (urls.length === 0) {
                 newBlocks.push(block);
                 continue;
             }
-
-            const matches = [...block.text.matchAll(IMAGE_URL_IN_TEXT_RE)];
-            if (matches.length === 0) {
-                newBlocks.push(block);
-                continue;
-            }
-
-            // 提取图片 URL 并创建 image block
-            for (const match of matches) {
-                let url = (match[1] || match[0]).trim();
-                // 清理 file:// 前缀
-                if (url.startsWith('file://')) {
-                    url = url.replace(/^file:\/\/\/?/, '/');
-                }
-
-                if (url.startsWith('/') || url.startsWith('~')) {
-                    // 本地文件路径 → 尝试读取
-                    newBlocks.push({
-                        type: 'image',
-                        source: { type: 'url', media_type: guessMediaType(url), data: url },
-                    } as any);
-                } else if (url.startsWith('http')) {
-                    newBlocks.push({
-                        type: 'image',
-                        source: { type: 'url', media_type: guessMediaType(url), data: url },
-                    } as any);
-                }
+            for (const url of urls) {
+                newBlocks.push({
+                    type: 'image',
+                    source: { type: 'url', media_type: guessMediaType(url), data: url },
+                } as any);
                 extractedUrls++;
             }
-
-            // 保留文本块（但移除其中的图片路径引用，避免模型看到路径后产生混乱）
-            let cleanedText = block.text;
-            for (const match of matches) {
-                cleanedText = cleanedText.replace(match[0], '[image]');
-            }
+            const cleanedText = cleanImagePathsFromText(block.text, urls);
             if (cleanedText.trim()) {
                 newBlocks.push({ type: 'text', text: cleanedText });
             }
         }
 
         if (extractedUrls > 0) {
-            console.log(`[Converter] 🔍 从文本中提取了 ${extractedUrls} 个图片 URL/路径`);
+            console.log(`[Converter] 🔍 从文本 blocks 中提取了 ${extractedUrls} 个图片路径`);
             msg.content = newBlocks as AnthropicContentBlock[];
         }
     }

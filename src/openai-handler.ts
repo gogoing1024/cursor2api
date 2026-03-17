@@ -395,6 +395,30 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
         toolCount: body.tools?.length ?? 0,
     });
 
+    // ★ 图片诊断日志：记录每条消息中的 content 格式，帮助定位客户端发送格式
+    if (body.messages) {
+        for (let i = 0; i < body.messages.length; i++) {
+            const msg = body.messages[i];
+            if (typeof msg.content === 'string') {
+                // 检查字符串中是否包含图片路径特征
+                if (/\.(jpg|jpeg|png|gif|webp|bmp|svg)/i.test(msg.content)) {
+                    console.log(`[OpenAI] 📋 消息[${i}] role=${msg.role} content=字符串(${msg.content.length}chars) ⚠️ 包含图片后缀: ${msg.content.substring(0, 200)}`);
+                }
+            } else if (Array.isArray(msg.content)) {
+                const types = (msg.content as any[]).map(p => {
+                    if (p.type === 'image_url') return `image_url(${(p.image_url?.url || p.url || '?').substring(0, 60)})`;
+                    if (p.type === 'image') return `image(${p.source?.type || '?'})`;
+                    if (p.type === 'input_image') return `input_image`;
+                    if (p.type === 'image_file') return `image_file`;
+                    return p.type;
+                });
+                if (types.some(t => t !== 'text')) {
+                    console.log(`[OpenAI] 📋 消息[${i}] role=${msg.role} blocks: [${types.join(', ')}]`);
+                }
+            }
+        }
+    }
+
     try {
         // Step 1: OpenAI → Anthropic 格式
         log.startPhase('convert', '格式转换 (OpenAI→Anthropic)');
